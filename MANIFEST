@@ -3,7 +3,8 @@ Generic.pm
 MANIFEST
 Makefile.PL
 test.pl
-testguts.pl
+testguts-fork.pl
+testguts-prefork.pl
 examples/elizad
 examples/shttpd
 examples/preforked-shttpd

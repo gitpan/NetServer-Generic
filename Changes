@@ -1,5 +1,12 @@
 Revision history for Perl extension NetServer::Generic.
 
+1.02 Wed Jun 27
+	bugfix: various suggestions by Lincoln Stein. 
+        - Switch from FIFO to pipe for controlling preforked children
+          (for Win32 compatability)
+        - Revised wait() behaviour for Solaris
+        - First attempt at fixing "thundering herd" problems
+
 1.01 Wed May 17 17:07:00 2000
         - bugfix: doesn't require a threaded perl now. Also tested on Solaris.
 

@@ -11,7 +11,7 @@ use IO::Socket;
 use IO::Handle;
 use IO::Select;
 use IO::Pipe;
-use POSIX qw(mkfifo BUFSIZ EWOULDBLOCK);
+use POSIX qw(mkfifo BUFSIZ EWOULDBLOCK WNOHANG);
 use Socket;
 use Time::HiRes qw(gettimeofday tv_interval);
 use Tie::RefHash;
@@ -28,7 +28,7 @@ BEGIN {
 
 @ISA = (qw(NetServer));
 
-$VERSION = "1.01";
+$VERSION = "1.02";
 
 use strict;
 
@@ -386,6 +386,75 @@ L<LWP>,
 L<perlfunc>,
 L<perlop/"I/O Operators">
 
+=head1 BUGS
+
+There are two bugs lurking in NetServer::Generic. Or maybe they're 
+design flaws. I don't have time to fix them right now, but maybe
+you'd like to contribute an hour or two and get your name in the
+credits?
+
+Bug the first:
+
+NetServer::Generic attempts to make it easy to write a server by letting
+the programmer concentrate on reading from STDIN and writing to STDOUT.
+However, this form of i/o is line oriented.  NetServer::Generic relies
+on the buffering and i/o capabilities provided by Perl and IO::Socket
+respectively. It doesn't buffer its own input.
+
+This means that in principle a malicious attacker (or just a badly-
+written client program) can write a stream of bytes to a
+NetServer::Generic application and, as long as those bytes don't
+include a "\n", Perl will keep gobbling it up until it runs out of
+virtual memory.
+
+This can be fixed by replacing the globbed IO::Socket::INET that is
+attached to STDIN with something else -- probably an object that presents
+itself as an IO::Stringy but that does its own buffering, so that it
+will return I<either> a line, or some sort of error message in $! if
+it sees something undigestible in its input stream. (If anyone wants
+to contribute a patch that fixes this, please feel free; this is an open
+source project, after all ...)
+
+Bug the second:
+
+The select-based server was originally written because I wanted to
+share state information between some forking servers and I couldn't
+use System V shared memory (the application had to be portable to a 
+flavour of UNIX that didn't support it). 
+
+It works okay, up to a point, but under heavy load on Linux it can run
+into major problems. Partly this may be attributable to deficiencies
+in the way Linux handles the select() system call (or so Stephen
+Tweedie keeps telling me), but the result is that the select-based
+server tends to drop some connections when it's under stress: if 
+two connections come in while it's serving another, the first may
+never get processed before a timeout occurs.
+
+A somewhat worse problem is that IO::Select doesn't do buffered (line-
+oriented) input; it just checks to see if one or more bytes are
+waiting to be read from one of the file handles it's got hold of. It
+is possible for a couple of bytes to come in (but not a whole line),
+so that the select-based server merrily tries to process a transaction
+and blocks until the rest of the input arrives -- thus ensuring that
+the server is bottlenecked by the speed of the slowest client connection.
+
+Suggestion: if you need to serve lots of connections using select(),
+look at the eventserver module instead. If you're a bit more
+ambitious, the defect in NetServer::Generic is fixable by writing a
+module with a similar API to IO::Select, but which provides buffering
+for the file handles under its control and which only returns
+something in response to can_read() when one of the buffers has a 
+complete line of input waiting.
+
+=head1 AUTHOR
+
+Charlie Stross (charle@antipope.org). With thanks for bugfixes and
+patches to Marius Kjeldahl I<marius@ace.funcom.com>, Art Sackett 
+I<asackett@artsackett.com>, Claudio Garcia I<cgarcia@dbitech.com>,
+Claudio Calvelli I<lunatic@assurdo.com>, Martin Waite
+I<Martin.Waite@montgomery134.freeserve.co.uk>. Debian package
+contributed by Jon Middleton, I<jjm@datacash.com>.
+
 =head1 HISTORY
 
 =over 4
@@ -439,6 +508,13 @@ Updated documentation
 Fix so it works on installations with no threading support (duh). Tested
 on Solaris, too.
 
+=item 1.02
+
+Bugfixes to the preforked mode (thanks to Art Sackett for detecting
+them). Bugfix to ok_to_serve() (thanks to Claudio Garcia,
+cgarcia@dbitech.com). Some notes on the two known bugs (related
+to buffering).
+
 =back
 
 
@@ -470,6 +546,8 @@ $NetServer::FieldTypes = {
                          "max_servers"       => "scalar",
                          "server_lifespan"   => "scalar",
                          "fifo"              => "scalar",
+                         "read_pipe"         => "scalar",
+                         "write_pipe"        => "scalar",
                          "handle"            => "IO::File",
                          "scoreboard"        => "hash",
                          "servername"        => "array",
@@ -499,7 +577,7 @@ $NetServer::default_cb = sub  {
 # Methods
 
 sub new {
-    print STDERR "[", join("][", @_), "]\n";
+    $NetServer::Debug && print STDERR "[", join("][", @_), "]\n";
     my ($class) = shift if @_;
     my ($self) = {"listen" => 5,
                   "timeout" => 60,
@@ -562,8 +640,13 @@ sub run_prefork {
     my $scoreboard = {}; 
     $self->scoreboard($scoreboard);
     # set up named pipe -- children will write, parent will read
-    my $fifo = $self->_new_fifo();
-    $self->fifo($fifo);
+    #my $fifo = $self->_new_fifo();
+    #$self->fifo($fifo);
+    # switch to using a pipe instead
+    pipe(READ_PIPE, WRITE_PIPE);
+    $self->{read_pipe} = *READ_PIPE;
+    $self->{write_pipe} = *WRITE_PIPE;
+    $self->root_pid($$);  # set server root PID
     # now create lots of spawn
     for (my $i = 0; $i < $start_servers; $i++) {
         my $pid = fork();
@@ -586,6 +669,10 @@ sub run_prefork {
     return;
 }
 
+sub reap_child {
+    do {} while waitpid(-1, WNOHANG) > 0;
+}
+
 sub _do_preforked_parent {
     my $self = shift;
     # we are a parent process to a bunch of raucous kiddies. We have an 
@@ -599,31 +686,25 @@ sub _do_preforked_parent {
     my $spare_servers   = ( $self->min_spare_servers() or 1     );
     my $max_servers     = ( $self->max_servers()       or 10    );
     my $scoreboard      = ( $self->scoreboard()        or {}    );
-    my $fifo            =   $self->fifo()            or do {
-        print STDERR "Oops! I have no scoreboard fifo to read from!\n";
-        print STDERR Dumper $self;
-        exit 0;
-    };
-    $NetServer::Generic::sigchld = sub {
-         $SIG{CHLD} = $NetServer::Generic::sigchld;
-         my $pid = wait;
-         print STDERR "SIGCHLD: $pid died and was waited for\n";
-    };
-    $SIG{CHLD} = $NetServer::Generic::sigchld;
+    $SIG{CHLD} = &reap_child();
     my @buffer = ();
     my $buffer = "";
     $NetServer::Debug && print STDERR "$n: About to loop on scoreboard file\n";
     my $loopcnt = 0;
     my $busycnt = 0;
     my @busyvec = ();
-    while(@buffer = $self->_read_fifo()) {
-        foreach $buffer (@buffer) {
-        print STDERR "busyvec: [", join("][", @busyvec), "]\n";
+    #while(@buffer = $self->_read_fifo()) {
+    *READ_PIPE = $self->read_pipe();
+    while($buffer = <READ_PIPE>) {
+        $NetServer::Debug 
+           && print STDERR "busyvec: [", join("][", @busyvec), "]\n";
         $loopcnt++;
-        print STDERR "$n: in fifo read loop $loopcnt\n";
+        $NetServer::Debug 
+            && print STDERR "$n: in pipe read loop $loopcnt\n";
         $buffer =~ tr/ //;
         chomp $buffer;
-        print STDERR "$n: buffer: $buffer\n";
+        $NetServer::Debug 
+            && print STDERR "$n: buffer: $buffer\n";
         my ($child_pid, $status) = split(/:/, $buffer);
         # kids write $$:busy or $$:idle into the pipe whenever 
         # they change state.
@@ -644,8 +725,8 @@ sub _do_preforked_parent {
             $scoreboard->{$child_pid} = "idle";
         }
         $NetServer::Debug && print STDERR "$n: $child_pid has status [",
-                             $scoreboard->{$child_pid}, "]\n";
-        print STDERR "$n: got ", scalar(@busyvec), " busy kids\n";
+                             $scoreboard->{$child_pid}, "]\n",
+                             "$n: got ", scalar(@busyvec), " busy kids\n";
         $busycnt = scalar(@busyvec);
         my $all_kids  = scalar keys %$scoreboard;
         $NetServer::Debug && 
@@ -654,7 +735,9 @@ sub _do_preforked_parent {
         if ((($all_kids - $busycnt) < $spare_servers) and 
             ($all_kids <= $max_servers)) {
             my $kids_to_launch = ($spare_servers - ($all_kids - $busycnt)) +1;
-            print STDERR "spare servers: $spare_servers, all kids: $all_kids, ",
+            $NetServer::Debug && 
+                 print STDERR "spare servers: $spare_servers, ",
+                         "all kids: $all_kids, ",
                          "busycnt: $busycnt\n", 
                          "kids to launch = spares - (all - busy) +1 ",
                          " => $kids_to_launch\n";
@@ -664,7 +747,8 @@ sub _do_preforked_parent {
                 my $pid = fork();
                 if ($pid == 0) {
                     # new child
-                    print STDERR "spawned child\n";
+                    $NetServer::Debug && 
+                        print STDERR "spawned child\n";
                     $self->_do_preforked_child();
                     exit 0;
                 } else {
@@ -678,7 +762,6 @@ sub _do_preforked_parent {
         $NetServer::Debug 
             && print STDERR "$n: scoreboard: \n", Dumper $scoreboard;
     } 
-    } # @buffer
     print STDERR "exited getline loop\n";
 }
 
@@ -696,19 +779,45 @@ sub _do_preforked_child {
     my $server_lifespan = ( $self->server_lifespan() or 1000  );
     my $my_age          = ( $self->my_age()          or 0     );
     my $main_sock       = $self->sock();
-    print STDERR "$n: main_sock is a ", (ref($main_sock) or " kangaroo "), "\n";
+    my $LOCK_SH = 1;
+    my $LOCK_EX = 2;
+    my $LOCK_NB = 4;
+    my $LOCK_UN = 8;
     my $rh              = new IO::Select($main_sock);
     $NetServer::Debug && print STDERR "$n: Created IO::Select()\n";
-    $self->_write_fifo("$$:start\n");
-    my (@ready) = ();
+    *WRITE_PIPE = $self->{write_pipe};
+    $NetServer::Debug 
+        && print WRITE_PIPE "$$:start\n";
+    my (@ready, @err) = ();
     $NetServer::Debug 
         && print STDERR "$n: about to call IO::Select->can_read()\n";
-    while (@ready = $rh->can_read()) { # BLOCKING
+    SELECT:
+    while (@ready = $rh->can_read() or @err = $rh->has_error(0)) { 
+        if (scalar(@err) > 0) {
+            foreach my $s (@err) {
+                if ($NetServer::Debug > 0) {
+                    print STDERR "Sock err: ", $s->error(), "\n";
+                }
+                if ($s->eof()) {
+                    $rh->remove($s);
+                    $s->close();
+                } else {
+                    $s->clearerr();
+                }
+            }
+            @err = ();
+            next SELECT;
+        }
         $NetServer::Debug && print STDERR "$n: got a connection\n";
         foreach my $sock (@ready) {
             $NetServer::Debug && print STDERR "$n: got a socket\n";
             if ($sock == $main_sock) {
+                flock($sock, $LOCK_EX) or do {
+                    print STDERR "+++ flock LOCK_EX failed on parent socket: ",
+                                 "$!\n";
+                };
                 my ($new_sock) = $sock->accept();
+                flock $sock, $LOCK_UN;
                 $new_sock->autoflush(1);
                 $rh->add($new_sock);
                 if (! $self->ok_to_serve($new_sock)) {
@@ -719,8 +828,8 @@ sub _do_preforked_child {
                 if (! eof($sock)) {
                     $my_age++;
                     $NetServer::Debug 
-                       && print STDERR "$n: self->_write_fifo($$:busy)\n";
-                    $self->_write_fifo("$$:busy\n");
+                       && print STDERR "$n: print WRITE_PIPE ($$:busy)\n";
+                    print WRITE_PIPE "$$:busy\n";
                     $NetServer::Debug 
                        && print STDERR "$n: serving connection\n";
                     $sock->autoflush(1);
@@ -737,12 +846,11 @@ sub _do_preforked_child {
                     &$code($self);
                     *STDIN = *OLD_STDIN;
                     *STDOUT = *OLD_STDOUT;
-                    $NetServer::Debug 
-                        && print STDERR "$n: self->_write_fifo($$:idle)\n";
-                    $NetServer::Debug 
-                        && print STDERR "$n: served $my_age calls\n";
-                    $self->_write_fifo("$$:idle\n");
-                    $self->_write_fifo("$$:idle\n");
+                    $NetServer::Debug && do { 
+                            print STDERR "$n: print WRITE_PIPE $$:idle\n",
+                                         "$n: served $my_age calls\n";
+                    };                
+                    print WRITE_PIPE "$$:idle\n$$:idle\n";
                     $rh->remove($sock);
                     close $sock;
                 } else {
@@ -756,15 +864,16 @@ sub _do_preforked_child {
         if ($my_age >= $server_lifespan) {
             $NetServer::Debug 
                 && print STDERR "$n: time to live exceeded\n",
-                                "$n: self->_write_fifo($$:exit)\n";
-            $self->_write_fifo("$$:exit\n");
+                                "$n: print WRITE_PIPE $$:exit\n";
+            #$self->_write_fifo("$$:exit\n");
+            print WRITE_PIPE "$$:exit\n";
             exit 0;
         }
     }
     $NetServer::Debug 
         && print STDERR "Warning! Should never reach this point:",
                         join("\n", caller()), "\n";
-    $self->_write_fifo("$$:exit\n");
+    print WRITE_PIPE "$$:exit\n";
     exit 0;
 }
 
@@ -788,7 +897,8 @@ sub run_select {
     $NetServer::Debug && print STDERR "Created IO::Select()\n";
     my (@ready) = ();
     while (@ready = $rh->can_read() ) {
-        print STDERR "NetServer::Generic::run_select(): got ",  
+        $NetServer::Debug && print STDERR 
+                     "NetServer::Generic::run_select(): got ",  
                      scalar(@ready), " handles at ", 
                      scalar(localtime(time)), "\n";
         my ($sock) = "";
@@ -863,8 +973,9 @@ sub run_thread {
   $NetServer::Debug && print STDERR "Created IO::Select()\n";
     my (@ready) = ();
     while (@ready = $rh->can_read()) {
-        print STDERR "NetServer::Generic::run_select(): got ",  
-                     scalar(@ready), " handles at ", scalar(localtime(time)), "\n";
+        $NetServer::Debug && print STDERR 
+            "NetServer::Generic::run_select(): got ",  
+            scalar(@ready), " handles at ", scalar(localtime(time)), "\n";
         my ($sock) = "";
         foreach $sock (@ready) {
             if ($sock == $main_sock) {
@@ -945,7 +1056,7 @@ sub run_fork {
                        };
     }
     # and make sure we wait() on children
-    $SIG{CHLD} = 'IGNORE'; 
+    $SIG{CHLD} = &reap_child();
     my $parent_callback = $self->parent_callback();
     my $ante_fork_callback = $self->ante_fork_callback();                       
 
@@ -1000,7 +1111,7 @@ sub run_fork {
 
 sub run_client {
     my ($self) = shift ;
-    $SIG{CHLD} = 'IGNORE'; #sub { wait() };
+    $SIG{CHLD} = &reap_child();
     
     # despatcher is a routine that dictates how often and how fast the
     # server forks and execs the test callback. The default sub (below)
@@ -1087,30 +1198,34 @@ sub ok_to_serve($$) {
         print STDERR "$0:$$: request from ", join(" ", @{$self->peer()}), "\n"; 
     return 1 if ((! defined($self->forbidden())) && 
                  (! defined($self->allowed())));
-    #
     # if we got here, forbidden or allowed are not undef, 
     # so we have to do some checking
     # Now we have the originator's hostname and IP address, we check
     # them against the allowed list and the forbidden list. 
     my ($found_allowed, $found_banned) = 0;
-    ALLOWED:
-    foreach (@{ $self->allowed() }) {
-        next if (! defined($_));
-        if (($peername =~ /^$_$/i) || ($peeraddr =~ /^$_$/i)) {
-            $found_allowed++;
-            $NetServer::Debug && 
-                print STDERR "allowed: $_ matched $peername or $peeraddr\n";
-            last ALLOWED;
+    if(defined ($self->allowed())) {
+        ALLOWED:
+        foreach (@{ $self->allowed() }) {
+            next if (! defined($_));
+            if (($peername =~ /^$_$/i) || ($peeraddr =~ /^$_$/i)) {
+                $found_allowed++;
+                $NetServer::Debug && 
+                    print STDERR "allowed: $_ matched $peername or $peeraddr\n";
+                last ALLOWED;
+            }
         }
     }
-    FORBIDDEN:
-    foreach (@{ $self->forbidden() } ) {
-        next if (! defined($_));
-        if (($peername =~ /^$_$/i) || ($peeraddr =~ /^$_$/i)) {
-            $found_banned++;
-            $NetServer::Debug && 
-                print STDERR "forbidden: $_ matched $peername or $peeraddr\n";
-            last FORBIDDEN;
+    if(defined ($self->forbidden())) { 
+        FORBIDDEN:
+        foreach (@{ $self->forbidden() } ) {
+            next if (! defined($_));
+            if (($peername =~ /^$_$/i) || ($peeraddr =~ /^$_$/i)) {
+                $found_banned++;
+                $NetServer::Debug && 
+                    print STDERR "forbidden: $_ matched $peername ",
+                                 "or $peeraddr\n";
+                last FORBIDDEN;
+            }
         }
     }
     ($found_banned && ! $found_allowed) && return 0;
@@ -1119,47 +1234,48 @@ sub ok_to_serve($$) {
     return 0;
 }
 
-sub _new_fifo {
-    my $self = shift;
-    # create a new named pipe. Return its filename. This is used by 
-    # the preforked server for children to send information back to their
-    # parent.
-    my $fname = "/tmp/fifo.$$";
-    my $mode = 666;
-    umask(0777); # possible security hole
-    mkfifo($fname, $mode) or die "Unable to mkfifo(): $!\n";
-    return $fname;
-}
-
-sub _read_fifo { # Blocking read
-    my $self = shift;
-    # read a line from the designated fifo named $self->fifo()
-    my $handle = $self->fifo();
-    $SIG{ALRM} = sub { close FIFO };
-    open(FIFO, "<$handle") or die "Can't open $handle: $!\n";
-    alarm(1);
-    my @buffer = (<FIFO>);
-    alarm(0);
-    close FIFO;
-    return @buffer;
-}
-
-sub _write_fifo { # Non-blocking write
-    my $self = shift;
-    my @args = @_;
-    my $handle = $self->fifo();
-    $SIG{ALRM} = sub { close FIFO };
-    open(FIFO, "+>$handle")  or die "Can't open $handle: $!\n";
-    alarm(1);
-    print FIFO @_;
-    alarm(0);
-    close FIFO;
-    return; 
-}
+#sub _new_fifo {
+#    my $self = shift;
+#    # create a new named pipe. Return its filename. This is used by 
+#    # the preforked server for children to send information back to their
+#    # parent.
+#    my $fname = "/tmp/fifo.$$";
+#    my $mode = 666;
+#    umask(0777); # possible security hole
+#    mkfifo($fname, $mode) or die "Unable to mkfifo(): $!\n";
+#    return $fname;
+#}
+#
+#sub _read_fifo { # Blocking read
+#    my $self = shift;
+#    # read a line from the designated fifo named $self->fifo()
+#    my $handle = $self->fifo();
+#    $SIG{ALRM} = sub { close FIFO };
+#    open(FIFO, "<$handle") or die "Can't open $handle: $!\n";
+#    alarm(1);
+#    my @buffer = (<FIFO>);
+#    alarm(0);
+#    close FIFO;
+#    return @buffer;
+#}
+#
+#sub _write_fifo { # Non-blocking write
+#    my $self = shift;
+#    my @args = @_;
+#    my $handle = $self->fifo();
+#    $SIG{ALRM} = sub { close FIFO };
+#    open(FIFO, "+>$handle")  or die "Can't open $handle: $!\n";
+#    alarm(1);
+#    print FIFO @_;
+#    alarm(0);
+#    close FIFO;
+#    return; 
+#}
 
 sub quit {
     my ($self) = shift;
-    print "called shutdown()\n";
+    $NetServer::Debug && print STDERR "called shutdown(): root_pid is ", 
+                           $self->root_pid(), "\n";
     kill 15, $self->root_pid();
     exit;
 }

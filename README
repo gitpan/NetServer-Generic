@@ -34,9 +34,9 @@ practice, viz (probably as root):
 
 NOTE: The test mechanism is slightly non-standard, because 
       NetServer::Generic's quit() method interferes with Test::Harness.
-      For this reason, the real test (testguts.pl) is invoked from within
-      test.pl. *** These tests will probably not work on a non-UNIX
-      platform. ***
+      For this reason, the real test (testguts-forked.pl for the forking
+      server and testguts-preforked.pl for the preforked server) is invoked 
+      from within test.pl. 
 
 Problems, questions, brickbats or plaudits to: charlie@antipope.org
 

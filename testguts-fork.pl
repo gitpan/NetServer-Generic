@@ -51,15 +51,17 @@ $j = 1;
 
 $out = *STDOUT;
 select STDERR; $| = 1;
-select STDIN;
+select STDOUT; $| = 1;
+#select STDIN;
 
 eval {
-FORK: {
+{
     if ($pid = fork) {
        # parent
        my ($foo) = new NetServer::Generic();
        $foo->port($port);
        $foo->hostname($host);
+       #$foo->allowed([ "localhost"]);
        my $server = sub {
            my $self = shift;
            while (defined($tmp = <STDIN>)) {
@@ -108,8 +110,10 @@ FORK: {
        exit 0;
     }
 }
-}; # end evail
+}; # end eval
 
 if ($@ ne '') {
    print "eval(): $@\n";
 }
+
+exit 0;
