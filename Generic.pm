@@ -28,7 +28,7 @@ BEGIN {
 
 @ISA = (qw(NetServer));
 
-$VERSION = "1.02";
+$VERSION = "1.03";
 
 use strict;
 
@@ -515,6 +515,11 @@ them). Bugfix to ok_to_serve() (thanks to Claudio Garcia,
 cgarcia@dbitech.com). Some notes on the two known bugs (related
 to buffering).
 
+=item 1.03
+
+Signal handling code was fixed to avoid leaving zombie processes
+(thanks to Luis Munoz, lem@cantv.net)
+
 =back
 
 
@@ -686,7 +691,7 @@ sub _do_preforked_parent {
     my $spare_servers   = ( $self->min_spare_servers() or 1     );
     my $max_servers     = ( $self->max_servers()       or 10    );
     my $scoreboard      = ( $self->scoreboard()        or {}    );
-    $SIG{CHLD} = &reap_child();
+    $SIG{CHLD} = \&reap_child;
     my @buffer = ();
     my $buffer = "";
     $NetServer::Debug && print STDERR "$n: About to loop on scoreboard file\n";
@@ -1056,7 +1061,7 @@ sub run_fork {
                        };
     }
     # and make sure we wait() on children
-    $SIG{CHLD} = &reap_child();
+    $SIG{CHLD} = \&reap_child;
     my $parent_callback = $self->parent_callback();
     my $ante_fork_callback = $self->ante_fork_callback();                       
 
@@ -1085,7 +1090,7 @@ sub run_fork {
                 select STDIN; $| = 1;
                 select STDOUT; $| = 1;
                 $self->sock($new_sock);
-                    &$code($self);
+		&$code($self);
             } else {
                 if ($NetServer::Debug) { 
                     print STDERR $$, " : ", scalar(localtime(time)), " : ", 
@@ -1111,7 +1116,7 @@ sub run_fork {
 
 sub run_client {
     my ($self) = shift ;
-    $SIG{CHLD} = &reap_child();
+    $SIG{CHLD} = \&reap_child;
     
     # despatcher is a routine that dictates how often and how fast the
     # server forks and execs the test callback. The default sub (below)
