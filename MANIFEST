@@ -6,5 +6,6 @@ test.pl
 testguts.pl
 examples/elizad
 examples/shttpd
+examples/preforked-shttpd
 README
 LICENSE
