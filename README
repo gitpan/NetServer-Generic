@@ -11,6 +11,7 @@ It requires:
 * The following modules:
   -- IO::Socket (part of the standard distribution, or available from
      CPAN)
+  -- IO::Select
   -- ChatBot::Eliza (optional: used by the elizad example)
 
 Two examples are included:
@@ -18,7 +19,9 @@ Two examples are included:
   elizad -- a simple psychotherapy daemon
   shttpd -- a really, stupidly, basic HTTP server
 
-(A future example including an SMTP daemon is planned)
+A test script, demonstrating client/nonforking operation, is also included.
+
+NetServer::Generic is required by NetServer::SMTP and the leafmail package.
 
 To install NetServer::Generic, follow the usual Perl module installation
 practice, viz (probably as root):
@@ -29,9 +32,16 @@ practice, viz (probably as root):
   make test
   make install
 
+NOTE: The test mechanism is slightly non-standard, because 
+      NetServer::Generic's quit() method interferes with Test::Harness.
+      For this reason, the real test (testguts.pl) is invoked from within
+      test.pl. *** These tests will probably not work on a non-UNIX
+      platform. ***
+
 Problems, questions, brickbats or plaudits to: charlie@antipope.org
 
 Enjoy!
 
 
 -- Charlie
+

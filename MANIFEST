@@ -3,6 +3,7 @@ Generic.pm
 MANIFEST
 Makefile.PL
 test.pl
+testguts.pl
 examples/elizad
 examples/shttpd
 README
