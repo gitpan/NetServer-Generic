@@ -18,8 +18,7 @@ use Tie::RefHash;
 
 BEGIN {
     if  (! eval "require Thread") {
-        # want warnings? uncomment the next line
-        # warn "Could not import Thread.pm: $@\n";
+        warn "Could not import Thread.pm: $@\n";
 	$MAIN::no_thread = 1;
     } else {
         Thread->import();

@@ -1,8 +1,5 @@
 Revision history for Perl extension NetServer::Generic.
 
-1.01 Wed May 17 17:07:00 2000
-        - bugfix: doesn't require a threaded perl now. Also tested on Solaris.
-
 1.00 Fri May 11 10:35:00 2000
         - added alpha-ish preforked server mode
         - added alpha-ish multithreaded mode (UNSTABLE)

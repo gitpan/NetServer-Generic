@@ -23,7 +23,7 @@ my ($cb) = sub {
 };  
 
 my (%config) =  ("port" => 9000, "callback" => $cb);
-my ($foo) = new NetServer::Generic(%config);
+my ($foo) = new Server(%config);
 
 print "$0 [$$] started on port 9000\n";
 $foo->run();
